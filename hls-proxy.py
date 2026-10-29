@@ -126,6 +126,7 @@ class Config:
             filter_groups=_split_filter(env.get("HLS_FILTER_GROUPS", "")),
             filter_countries=_split_filter(env.get("HLS_FILTER_COUNTRIES", "")),
             filter_languages=_split_filter(env.get("HLS_FILTER_LANGUAGES", "")),
+            extra_allowed_hosts=tuple(h.lower() for h in _split_list(env.get("HLS_EXTRA_ALLOWED_HOSTS", ""))),
         )
 
 
@@ -213,7 +214,18 @@ class _PolicyRedirectHandler(urllib.request.HTTPRedirectHandler):
         if target:
             # Runs before urllib's own scheme check, so file:/ftp: hops are
             # refused as policy errors rather than generic HTTP errors.
-            self.app.check_url(urllib.parse.urljoin(req.full_url, target))
+            self._check(urllib.parse.urljoin(req.full_url, target))
+
+    def _check(self, url):
+        try:
+            self.app.check_url(url)
+        except PolicyError as e:
+            # Name the refused host (never the URL: its query can hold tokens)
+            # so a missing allow-list entry is visible in the 403 and the log.
+            host = _host_of(url)
+            if host and str(e) == "Unknown upstream host":
+                raise PolicyError(f"{e} (redirect to {host})") from None
+            raise
 
     def http_error_302(self, req, fp, code, msg, headers):
         self._check_hop(req, headers)
@@ -222,7 +234,7 @@ class _PolicyRedirectHandler(urllib.request.HTTPRedirectHandler):
     http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        self.app.check_url(urllib.parse.urljoin(req.full_url, newurl))
+        self._check(urllib.parse.urljoin(req.full_url, newurl))
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -711,7 +723,7 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
                 content = resp.read()
                 resp.close()
                 if b"#EXTM3U" in content:
-                    content = self._rewrite_playlist(content, upstream_url, ch)
+                    content = self._rewrite_playlist(content, resp.geturl(), ch)
                     content_type = "application/vnd.apple.mpegurl"
                 self._write_body(200, content_type, content, [
                     ("Access-Control-Allow-Origin", "*"),
@@ -893,7 +905,7 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
                 ])
                 return
 
-            content = self._rewrite_playlist(content, m3u8_url, slug)
+            content = self._rewrite_playlist(content, resp.geturl(), slug)
             if bandwidth and is_master:
                 content = self._override_master_bandwidth(content, bandwidth)
             self._write_body(200, "application/vnd.apple.mpegurl", content, [
@@ -935,7 +947,8 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
     def _rewrite_playlist(self, content: bytes, playlist_url: str, ch=None) -> bytes:
         """Rewrite URLs in m3u8 playlists to route through this proxy."""
         text = content.decode("utf-8", errors="replace")
-        base_url = playlist_url.rsplit("/", 1)[0] + "/"
+        # Directory of the playlist, ignoring any query or fragment.
+        base_url = playlist_url.split("#", 1)[0].split("?", 1)[0].rsplit("/", 1)[0] + "/"
         lines = text.splitlines()
         result = []
 

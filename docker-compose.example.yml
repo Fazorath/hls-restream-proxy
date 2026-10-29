@@ -13,5 +13,8 @@ services:
       # Required: the proxy refuses to start on 0.0.0.0 without it.
       # IPs or CIDRs, e.g. the Docker network's subnet.
       - HLS_ALLOWED_IPS=172.16.0.0/12
+      # Optional: hosts a playlist's redirects lead to that the playlists don't name.
+      # Comma or space separated. A refused redirect's 403 names the host to add.
+      # - HLS_EXTRA_ALLOWED_HOSTS=cdn.example.com
       - HLS_CACHE_TTL=3600
     restart: unless-stopped
