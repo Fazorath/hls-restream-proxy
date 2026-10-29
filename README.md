@@ -328,3 +328,11 @@ mpv http://localhost:8089/channel/sporttv1
 ## License
 
 MIT
+
+## Multiple upstream M3U lists
+
+- `HLS_UPSTREAM_M3U_URLS`: comma or whitespace separated M3U URLs, merged in order. The older `HLS_UPSTREAM_M3U_URL` is still read and goes first.
+- Each list is cached for `HLS_UPSTREAM_M3U_TTL` seconds on its own; a list that fails, is empty or exceeds `HLS_UPSTREAM_M3U_MAX_BYTES` (default 10 MiB) keeps its last good copy.
+- A stream URL that appears in several lists is kept once, from the first list.
+- Per-channel `#EXTVLCOPT:http-referrer=` and `http-user-agent=` lines are sent on that channel's playlist and segment requests. Referer precedence: per-channel, then `HLS_UPSTREAM_M3U_REFERER`, then the global setting.
+- Source `tvg-id` values pass through to `/playlist.m3u` unchanged. `channels.conf` takes an optional 10th `tvg_id` field.
