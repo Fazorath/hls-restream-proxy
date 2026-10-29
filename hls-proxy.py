@@ -51,6 +51,11 @@ def _parse_client_networks(raw):
     return tuple(nets)
 
 
+def _split_filter(raw):
+    """Split a filter setting on commas and semicolons (names may hold spaces)."""
+    return tuple(x.strip() for x in re.split(r"[,;]", raw) if x.strip())
+
+
 def _split_list(raw):
     """Split a comma/whitespace separated list, dropping empties."""
     return tuple(x for x in re.split(r"[,\s]+", raw) if x)
@@ -80,6 +85,11 @@ class Config:
     upstream_m3u_max_bytes: int = 10 * 1024 * 1024
     upstream_m3u_referer: str = ""
     upstream_m3u_ttl: int = 3600
+    # Allow-lists applied to upstream M3U entries (not channels.conf). Empty
+    # allows everything; an entry lacking the attribute a filter needs is kept.
+    filter_groups: tuple = ()
+    filter_countries: tuple = ()
+    filter_languages: tuple = ()
     # Extra hostnames /proxy may fetch, on top of those learned from sources.
     extra_allowed_hosts: tuple = ()
     # UNSAFE, tests only, never read from the environment: lets upstreams
@@ -113,6 +123,9 @@ class Config:
             upstream_m3u_max_bytes=int(env.get("HLS_UPSTREAM_M3U_MAX_BYTES", str(10 * 1024 * 1024))),
             upstream_m3u_referer=env.get("HLS_UPSTREAM_M3U_REFERER", ""),
             upstream_m3u_ttl=int(env.get("HLS_UPSTREAM_M3U_TTL", str(cache_ttl))),
+            filter_groups=_split_filter(env.get("HLS_FILTER_GROUPS", "")),
+            filter_countries=_split_filter(env.get("HLS_FILTER_COUNTRIES", "")),
+            filter_languages=_split_filter(env.get("HLS_FILTER_LANGUAGES", "")),
         )
 
 
@@ -150,6 +163,43 @@ def _slugify(s: str) -> str:
     """Reduce a string to a URL-safe channel slug."""
     s = re.sub(r"[^A-Za-z0-9_-]+", "-", s).strip("-").lower()
     return s or "channel"
+
+
+def _attr_values(extinf, name):
+    """Values of an #EXTINF attribute, split on ';' and lowercased; None if absent or empty."""
+    m = re.search(rf'{re.escape(name)}="([^"]*)"', extinf)
+    vals = [v.strip().lower() for v in m.group(1).split(";") if v.strip()] if m else []
+    return vals or None
+
+
+def _entry_countries(extinf):
+    vals = _attr_values(extinf, "tvg-country")
+    if vals:
+        return vals
+    # iptv-org style ids: "ChannelName.us" or "ChannelName.us@SD"
+    m = re.search(r'tvg-id="[^"]*\.([A-Za-z]{2})(?:@[^"]*)?"', extinf)
+    return [m.group(1).lower()] if m else None
+
+
+def filter_entry(config, extinf):
+    """Apply the allow-lists to one upstream entry.
+
+    Returns (keep, unfiltered): unfiltered is True when the entry was kept only
+    because it lacks an attribute that an active filter needs.
+    """
+    unfiltered = False
+    for wanted, values in (
+        (config.filter_groups, _attr_values(extinf, "group-title")),
+        (config.filter_countries, _entry_countries(extinf)),
+        (config.filter_languages, _attr_values(extinf, "tvg-language")),
+    ):
+        if not wanted:
+            continue
+        if values is None:
+            unfiltered = True
+        elif not set(values) & {w.lower() for w in wanted}:
+            return False, False
+    return True, unfiltered
 
 
 class _PolicyRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -204,6 +254,8 @@ class ProxyApp:
         self.m3u_opts = {}
         # Per-source state: url -> {"entries": [(extinf, url, referer, ua)], "fetched_at": float}
         self.m3u_sources = {}
+        # Per-source filter counts, in source order: [{"loaded", "kept", "dropped", "unfiltered"}]
+        self.m3u_stats = []
         # Per-channel #EXTINF line built from channels.conf (slug -> extinf)
         self.channel_extinf = {}
         self._resolve = socket.getaddrinfo  # overridable seam for offline tests
@@ -341,11 +393,21 @@ class ProxyApp:
             for url, entries in fetched.items():
                 self.m3u_sources[url] = {"entries": entries, "fetched_at": now}
             merged = []
+            stats = []
             seen_urls = set()
             seen_slugs = set()
             idx = 0
             for url in cfg.m3u_sources():
+                st = {"loaded": 0, "kept": 0, "dropped": 0, "unfiltered": 0}
+                stats.append(st)
                 for extinf, stream, referer, ua in self.m3u_sources.get(url, {"entries": []})["entries"]:
+                    st["loaded"] += 1
+                    keep, unfiltered = filter_entry(cfg, extinf)
+                    if not keep:
+                        st["dropped"] += 1
+                        continue
+                    st["kept"] += 1
+                    st["unfiltered"] += unfiltered
                     if stream in seen_urls:
                         continue
                     seen_urls.add(stream)
@@ -369,6 +431,7 @@ class ProxyApp:
                     # Invalidate stale cache so a refreshed upstream URL replaces the old one
                     self.channel_cache.pop(slug, None)
             self.upstream_m3u = merged
+            self.m3u_stats = stats
         print(f"[hls-proxy] Loaded {len(merged)} channels from {len(cfg.m3u_sources())} upstream M3U source(s)")
 
     def load_channels(self):
@@ -698,11 +761,18 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
         host = self.headers.get("Host", f"{cfg.bind_addr}:{cfg.port}").split("/", 1)[0]
         upstream = "configured" if cfg.m3u_sources() else "not set (HLS_UPSTREAM_M3U_URLS)"
         channels_loaded = len(self.app.upstream_m3u)
+        with self.app.lock:
+            stats = list(self.app.m3u_stats)
+        per_source = "".join(
+            f"  source {i}: loaded {st['loaded']}, kept {st['kept']}, "
+            f"dropped {st['dropped']}, unfiltered {st['unfiltered']}\n"
+            for i, st in enumerate(stats, 1))
         body = (
             f"hls-restream-proxy\n"
             f"==================\n\n"
             f"Upstream M3U:   {upstream}\n"
-            f"Channels loaded: {channels_loaded}\n\n"
+            f"Channels loaded: {channels_loaded}\n"
+            f"{per_source}\n"
             f"Endpoints:\n"
             f"  http://{host}/playlist.m3u           — M3U for your media player\n"
             f"  http://{host}/channel/<slug>         — single channel (master playlist)\n"
