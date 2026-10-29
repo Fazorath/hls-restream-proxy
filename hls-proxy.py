@@ -7,7 +7,7 @@ segments through the proxy — no client-side header configuration needed.
 Supports /channel/<slug> endpoints that auto-scrape fresh m3u8 URLs on the fly,
 so media servers never see expired tokens.
 
-Zero dependencies — stdlib only (Python 3.8+).
+Zero dependencies — stdlib only (Python 3.9+).
 """
 
 import dataclasses
@@ -17,6 +17,7 @@ import os
 import re
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -161,6 +162,8 @@ class ProxyApp:
 
     def __init__(self, config):
         self.config = config
+        # Guards every shared dict below. Never held across a network fetch.
+        self.lock = threading.RLock()
         self.allowed_hosts = set(h.lower() for h in config.extra_allowed_hosts)
         if config.upstream_m3u_url:
             self.allow_url_host(config.upstream_m3u_url)
@@ -196,7 +199,8 @@ class ProxyApp:
     def allow_url_host(self, url):
         host = _host_of(url)
         if host:
-            self.allowed_hosts.add(host)
+            with self.lock:
+                self.allowed_hosts.add(host)
 
     def check_url(self, url):
         """Raise PolicyError unless url may be fetched. Fetches nothing."""
@@ -253,8 +257,9 @@ class ProxyApp:
         if not cfg.upstream_m3u_url:
             return
         now = time.time()
-        if self.upstream_m3u and (now - self.upstream_m3u_fetched_at) < cfg.upstream_m3u_ttl:
-            return
+        with self.lock:
+            if self.upstream_m3u and (now - self.upstream_m3u_fetched_at) < cfg.upstream_m3u_ttl:
+                return
 
         try:
             with self.fetch(cfg.upstream_m3u_url, {"User-Agent": cfg.upstream_ua}) as resp:
@@ -263,6 +268,12 @@ class ProxyApp:
             print(f"[hls-proxy] Failed to fetch upstream M3U: {e}")
             return
 
+        with self.lock:
+            self._apply_upstream_m3u(text, now)
+
+    def _apply_upstream_m3u(self, text, now):
+        """Parse fetched M3U text into shared state. Caller holds self.lock."""
+        cfg = self.config
         entries = []
         seen = set()
         current_extinf = None
@@ -317,6 +328,17 @@ class ProxyApp:
 
     def load_channels(self):
         """Load channel config: slug -> source_page_url."""
+        with self.lock:
+            channels = self._read_conf()
+        # The upstream M3U fetch happens outside the lock.
+        self.refresh_upstream_m3u()
+        with self.lock:
+            for slug, _extinf, url in self.upstream_m3u:
+                channels.setdefault(slug, url)
+        return channels
+
+    def _read_conf(self):
+        """Parse channels.conf into shared state. Caller holds self.lock."""
         channels = {}
         conf = self.config.channels_conf
         if not conf:
@@ -367,12 +389,6 @@ class ProxyApp:
                             except ValueError:
                                 pass
 
-        # Overlay entries from the upstream M3U (if configured). File entries win
-        # on slug collisions so the user can override a specific channel by hand.
-        self.refresh_upstream_m3u()
-        for slug, _extinf, url in self.upstream_m3u:
-            channels.setdefault(slug, url)
-
         return channels
 
     def scrape_m3u8(self, source_url):
@@ -414,7 +430,8 @@ class ProxyApp:
     def get_channel_m3u8(self, slug):
         """Get a fresh m3u8 URL for a channel, using cache if still valid."""
         now = time.time()
-        cached = self.channel_cache.get(slug)
+        with self.lock:
+            cached = self.channel_cache.get(slug)
         if cached and (now - cached["fetched_at"]) < self.config.cache_ttl:
             return cached["m3u8_url"], cached["embed_host"]
 
@@ -425,19 +442,23 @@ class ProxyApp:
 
         # Literal mode: source_url is the m3u8 itself; skip scraping. Treat the
         # declared referer as the "embed host" proxy so downstream /proxy calls use it.
-        if self.channel_mode.get(slug) == "literal":
+        with self.lock:
+            literal = self.channel_mode.get(slug) == "literal"
             referer = self.channel_referer.get(slug, "")
+        if literal:
             embed_host = referer.rstrip("/") if referer else ""
-            self.channel_cache[slug] = {"m3u8_url": source_url, "embed_host": embed_host, "fetched_at": now}
+            with self.lock:
+                self.channel_cache[slug] = {"m3u8_url": source_url, "embed_host": embed_host, "fetched_at": now}
             return source_url, embed_host
 
         m3u8, embed_host = self.scrape_m3u8(source_url)
         if m3u8:
-            self.channel_cache[slug] = {"m3u8_url": m3u8, "embed_host": embed_host, "fetched_at": now}
             # Learn the referer for this upstream host so /proxy requests use it
             origin = _origin_of(m3u8)
-            if origin and embed_host:
-                self.referer_map[origin] = embed_host + "/"
+            with self.lock:
+                self.channel_cache[slug] = {"m3u8_url": m3u8, "embed_host": embed_host, "fetched_at": now}
+                if origin and embed_host:
+                    self.referer_map[origin] = embed_host + "/"
         return m3u8, embed_host
 
 
@@ -560,22 +581,30 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
                 if cl:
                     self.send_header("Content-Length", cl)
                 self.end_headers()
-                try:
-                    while True:
-                        chunk = resp.read(65536)
-                        if not chunk:
-                            break
-                        try:
-                            self.wfile.write(chunk)
-                        except (BrokenPipeError, ConnectionResetError):
-                            return
-                finally:
-                    resp.close()
+                self._stream_body(resp)
 
         except PolicyError as e:
             self.send_error(403, str(e))
         except Exception as e:
             self.send_error(502, f"Upstream error: {e}")
+
+    def _stream_body(self, resp):
+        """Copy resp to the client after headers are sent.
+
+        Any failure here (client gone, upstream died) just closes the
+        connection: a second status line would corrupt the response.
+        """
+        self.close_connection = True
+        try:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except Exception:
+            pass
+        finally:
+            resp.close()
 
     def _handle_index(self):
         """Plain-text landing page describing available endpoints."""
@@ -693,17 +722,7 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
                 if cl:
                     self.send_header("Content-Length", cl)
                 self.end_headers()
-                try:
-                    while True:
-                        chunk = resp.read(65536)
-                        if not chunk:
-                            break
-                        try:
-                            self.wfile.write(chunk)
-                        except (BrokenPipeError, ConnectionResetError):
-                            return
-                finally:
-                    resp.close()
+                self._stream_body(resp)
                 return
 
             content = resp.read()
@@ -821,7 +840,8 @@ def build_server(config):
             "Set HLS_ALLOWED_IPS (IPs/CIDRs), or HLS_ALLOW_ALL_CLIENTS=1 to opt out."
         )
     app = ProxyApp(config)
-    server = http.server.HTTPServer((config.bind_addr, config.port), HLSProxyHandler)
+    server = http.server.ThreadingHTTPServer((config.bind_addr, config.port), HLSProxyHandler)
+    server.daemon_threads = True
     server.app = app
     return server
 
