@@ -332,6 +332,7 @@ MIT
 ## Multiple upstream M3U lists
 
 - `HLS_UPSTREAM_M3U_URLS`: comma or whitespace separated M3U URLs, merged in order. The older `HLS_UPSTREAM_M3U_URL` is still read and goes first.
+- `HLS_FILTER_GROUPS`, `HLS_FILTER_COUNTRIES`, `HLS_FILTER_LANGUAGES`: comma or semicolon separated allow-lists applied to upstream M3U entries, matched case-insensitively against `group-title` (`;`-packed values match any part), `tvg-country` (else the iptv-org style `tvg-id` suffix, e.g. `Name.us@SD`) and `tvg-language`. Empty allows everything. An entry missing the attribute a filter needs is kept (counted as "unfiltered" on the index page). `channels.conf` entries are never filtered; dropped channels are not listed and return 404 under `/channel/`. The index page shows loaded/kept/dropped/unfiltered counts per source.
 - Each list is cached for `HLS_UPSTREAM_M3U_TTL` seconds on its own; a list that fails, is empty or exceeds `HLS_UPSTREAM_M3U_MAX_BYTES` (default 10 MiB) keeps its last good copy.
 - A stream URL that appears in several lists is kept once, from the first list.
 - Per-channel `#EXTVLCOPT:http-referrer=` and `http-user-agent=` lines are sent on that channel's playlist and segment requests. Referer precedence: per-channel, then `HLS_UPSTREAM_M3U_REFERER`, then the global setting.
