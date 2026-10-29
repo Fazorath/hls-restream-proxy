@@ -10,6 +10,8 @@ services:
     environment:
       - HLS_PROXY_PORT=8089
       - HLS_PROXY_BIND=0.0.0.0
-      - HLS_ALLOWED_IPS=              # comma-separated, empty = allow all
+      # Required: the proxy refuses to start on 0.0.0.0 without it.
+      # IPs or CIDRs, e.g. the Docker network's subnet.
+      - HLS_ALLOWED_IPS=172.16.0.0/12
       - HLS_CACHE_TTL=3600
     restart: unless-stopped

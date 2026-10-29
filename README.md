@@ -255,7 +255,8 @@ curl -sL -A "Mozilla/5.0" "https://streaming-site.com/channel.php" \
 | `HLS_PROXY_BIND` | `127.0.0.1` | Bind address (localhost only by default) |
 | `HLS_PROXY_UA` | Chrome UA string | User-Agent sent to upstream |
 | `HLS_PROXY_REFERER` | _(empty)_ | Fallback Referer header (auto-learned from /channel/) |
-| `HLS_ALLOWED_IPS` | _(empty)_ | Comma-separated client IP allowlist (empty = all) |
+| `HLS_ALLOWED_IPS` | _(empty)_ | Comma-separated client IPs or CIDRs (e.g. `172.18.0.0/16`). Required when binding a non-loopback address |
+| `HLS_ALLOW_ALL_CLIENTS` | _(unset)_ | Set to `1` to start on a non-loopback bind with no `HLS_ALLOWED_IPS` (accepts every client; not recommended) |
 | `CHANNELS_CONF` | `./channels.conf` | Path to channel config file |
 | `HLS_CACHE_TTL` | `3600` | Seconds to cache scraped m3u8 URLs (per channel) |
 | `HLS_DEFAULT_BANDWIDTH` | _(empty)_ | Fallback BANDWIDTH (bits/sec) advertised in the master playlist when a channel has no value set in `channels.conf`. Prevents Jellyfin's ~20 Mbps default guess. |
