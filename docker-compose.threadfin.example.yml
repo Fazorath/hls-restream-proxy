@@ -12,6 +12,9 @@ services:
       - HLS_PROXY_BIND=0.0.0.0
       # The stack subnet below: only Threadfin (and other stack members) may call the proxy.
       - HLS_ALLOWED_IPS=172.28.0.0/24
+      # Optional: hosts a playlist's redirects lead to that the playlists don't name.
+      # Comma or space separated. A refused redirect's 403 names the host to add.
+      # - HLS_EXTRA_ALLOWED_HOSTS=cdn.example.com
       - HLS_CACHE_TTL=3600
     networks:
       - livetv

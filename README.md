@@ -278,6 +278,7 @@ curl -sL -A "Mozilla/5.0" "https://broadcaster.example/live" \
 | `HLS_PROXY_REFERER` | _(empty)_ | Fallback Referer header (auto-learned from /channel/) |
 | `HLS_ALLOWED_IPS` | _(empty)_ | Comma-separated client IPs or CIDRs (e.g. `172.18.0.0/16`). Required when binding a non-loopback address |
 | `HLS_ALLOW_ALL_CLIENTS` | _(unset)_ | Set to `1` to start on a non-loopback bind with no `HLS_ALLOWED_IPS` (accepts every client; not recommended) |
+| `HLS_EXTRA_ALLOWED_HOSTS` | _(empty)_ | Comma or space separated hostnames (e.g. `cdn.example.com`) the proxy may fetch beyond those named in your playlists. Use it for redirect targets the playlists don't name, such as a short link that 302s to another host. Redirects to hosts not listed are still refused, and the 403 names the refused host |
 | `CHANNELS_CONF` | `./channels.conf` | Path to channel config file |
 | `HLS_CACHE_TTL` | `3600` | Seconds to cache scraped m3u8 URLs (per channel) |
 | `HLS_DEFAULT_BANDWIDTH` | _(empty)_ | Fallback BANDWIDTH (bits/sec) advertised in the master playlist when a channel has no value set in `channels.conf`. Prevents Jellyfin's ~20 Mbps default guess. |
