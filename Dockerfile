@@ -19,6 +19,6 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8089
 
 HEALTHCHECK --interval=30s --timeout=3s \
-  CMD wget -qO- http://localhost:8089/health || exit 1
+  CMD wget -qO- http://127.0.0.1:8089/health || exit 1
 
 ENTRYPOINT ["python3", "hls-proxy.py"]
