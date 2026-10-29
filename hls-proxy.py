@@ -11,6 +11,7 @@ Zero dependencies — stdlib only (Python 3.9+).
 """
 
 import dataclasses
+import http.client
 import http.server
 import ipaddress
 import os
@@ -203,6 +204,33 @@ def filter_entry(config, extinf):
     return True, unfiltered
 
 
+def _pinned(app, conn):
+    """Make conn connect only to an address that passes the policy at connect time."""
+    conn._create_connection = lambda address, timeout=None, source_address=None: app.connect(
+        address[0], address[1], timeout)
+    return conn
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+
+    def http_open(self, req):
+        return self.do_open(lambda *a, **k: _pinned(self.app, http.client.HTTPConnection(*a, **k)), req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+
+    def https_open(self, req):
+        # server_hostname stays the URL's hostname, so the certificate check is unchanged.
+        return self.do_open(lambda *a, **k: _pinned(self.app, http.client.HTTPSConnection(*a, **k)),
+                            req, context=self._context)
+
+
 class _PolicyRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Re-applies the upstream URL policy to every redirect hop."""
 
@@ -274,12 +302,13 @@ class ProxyApp:
         self.conf_urls = {}
         # (inode, mtime_ns, size) of channels.conf at the last read
         self.conf_stamp = None
-        self._resolve = socket.getaddrinfo  # overridable seam for offline tests
+        self._resolve = socket.getaddrinfo  # overridable seams for offline tests
+        self._dial = lambda ip, port, timeout: socket.create_connection((ip, port), timeout)
         self._opener = urllib.request.OpenerDirector()
         # Only http(s): no file:, ftp: or data: handlers are installed.
         for h in (
-            urllib.request.HTTPHandler(),
-            urllib.request.HTTPSHandler(),
+            _PinnedHTTPHandler(self),
+            _PinnedHTTPSHandler(self),
             urllib.request.HTTPDefaultErrorHandler(),
             urllib.request.HTTPErrorProcessor(),
             _PolicyRedirectHandler(self),
@@ -312,16 +341,37 @@ class ProxyApp:
             raise PolicyError("Unknown upstream host")
         if self.config.allow_private_upstreams:
             return
+        self._public_addresses(host, parts.port or 80)
+
+    def _public_addresses(self, host, port):
+        """Resolve host; return its addresses, or raise PolicyError if any is non-public."""
         try:
-            infos = self._resolve(host, parts.port or 80, type=socket.SOCK_STREAM)
+            infos = self._resolve(host, port, type=socket.SOCK_STREAM)
         except OSError:
             raise PolicyError("Host does not resolve")
         if not infos:
             raise PolicyError("Host does not resolve")
+        addrs = []
         for info in infos:
             ip = _normalize_ip(info[4][0])
             if not ip.is_global or ip.is_multicast:
                 raise PolicyError("Non-public upstream address")
+            addrs.append(str(ip))
+        return addrs
+
+    def connect(self, host, port, timeout):
+        """Open the socket for an upstream fetch. The address that passed the
+        policy is the one connected to, so a DNS answer that changes between
+        the check and the connect (DNS rebinding) can't reach a private address."""
+        if self.config.allow_private_upstreams:
+            return socket.create_connection((host, port), timeout)
+        err = OSError("no address")
+        for ip in self._public_addresses(host, port):  # same fallback create_connection gives
+            try:
+                return self._dial(ip, port, timeout)
+            except OSError as e:
+                err = e
+        raise err
 
     def fetch(self, url, headers, timeout=15):
         """Open url through the policy-enforcing opener."""
