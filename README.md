@@ -34,7 +34,7 @@ Many free IPTV/HLS sources require specific HTTP headers (User-Agent, Referer) t
 
 ## Requirements
 
-- Python 3.8+ (stdlib only, no pip packages)
+- Python 3.9+ (stdlib only, no pip packages)
 - bash, curl, grep (with PCRE / `-P`)
 
 ## Quick start
