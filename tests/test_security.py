@@ -1,3 +1,4 @@
+import socket
 import os
 import tempfile
 import unittest
@@ -99,11 +100,23 @@ class UpstreamPolicyTest(unittest.TestCase):
             return [(2, 1, 6, "", ("8.8.8.8", 0))]
 
         p.server.app._resolve = resolver
+        # the pinned connect dials the "public" address; send it to the fake on loopback
+        p.server.app._dial = lambda ip, port, timeout: socket.create_connection(("127.0.0.1", port), timeout)
         self.up.routes["/r.ts"] = (302, {"Location": f"http://internal.test:{self.up.port}/ok.ts"}, b"")
-        # urllib connects with its own DNS lookup, so only the redirect hop matters here
         status, _ = p.get(p.proxy_url(f"http://localhost:{self.up.port}/r.ts"))
         self.assertEqual(status, 403)
         self.assertEqual([path for path, _ in self.up.requests], ["/r.ts"])
+
+    def test_dns_rebinding_between_check_and_connect_is_refused(self):
+        # First answer is public (passes check_url), every later one is loopback,
+        # where the fake upstream really listens. The connection must not be made.
+        p = self.start(allow_private_upstreams=False, extra_allowed_hosts=("localhost",))
+        answers = iter(["8.8.8.8"] * 2)  # the handler and fetch() each run check_url once
+        p.server.app._resolve = lambda host, *a, **k: [(2, 1, 6, "", (next(answers, "127.0.0.1"), 0))]
+        self.up.routes["/ok.ts"] = (200, {"Content-Type": "video/mp2t"}, b"data")
+        status, _ = p.get(p.proxy_url(f"http://localhost:{self.up.port}/ok.ts"))
+        self.assertEqual(status, 403)
+        self.assertEqual(self.up.requests, [])
 
     def test_playlist_referenced_hosts_become_allowed(self):
         self.up.routes["/pl.m3u8"] = (
@@ -216,3 +229,19 @@ class ChannelFetchPolicyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConnectFallbackTest(unittest.TestCase):
+    def test_next_address_is_tried_when_the_first_is_unreachable(self):
+        app = hls_proxy.ProxyApp(hls_proxy.Config())
+        app._resolve = lambda host, *a, **k: [(10, 1, 6, "", ("2606:4700::1", 0)), (2, 1, 6, "", ("8.8.8.8", 0))]
+        tried = []
+
+        def dial(ip, port, timeout):
+            tried.append(ip)
+            if ":" in ip:
+                raise OSError("no route")
+            return "sock"
+        app._dial = dial
+        self.assertEqual(app.connect("cdn.example", 443, 5), "sock")
+        self.assertEqual(tried, ["2606:4700::1", "8.8.8.8"])
