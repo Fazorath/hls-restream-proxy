@@ -51,6 +51,11 @@ def _parse_client_networks(raw):
     return tuple(nets)
 
 
+def _split_list(raw):
+    """Split a comma/whitespace separated list, dropping empties."""
+    return tuple(x for x in re.split(r"[,\s]+", raw) if x)
+
+
 @dataclasses.dataclass
 class Config:
     port: int = 8089
@@ -69,6 +74,10 @@ class Config:
     # Optional upstream M3U playlist: every #EXTINF entry becomes a literal-mode
     # channel, so /playlist.m3u carries DEFAULT_BANDWIDTH on each stream.
     upstream_m3u_url: str = ""
+    # Further upstream M3U lists, merged after upstream_m3u_url (first source
+    # wins when two lists carry the same stream URL).
+    upstream_m3u_urls: tuple = ()
+    upstream_m3u_max_bytes: int = 10 * 1024 * 1024
     upstream_m3u_referer: str = ""
     upstream_m3u_ttl: int = 3600
     # Extra hostnames /proxy may fetch, on top of those learned from sources.
@@ -76,6 +85,14 @@ class Config:
     # UNSAFE, tests only, never read from the environment: lets upstreams
     # resolve to loopback/private addresses so a local fake upstream works.
     allow_private_upstreams: bool = False
+
+    def m3u_sources(self):
+        """All upstream M3U URLs, old single-URL setting first, no repeats."""
+        out = []
+        for u in ((self.upstream_m3u_url,) if self.upstream_m3u_url else ()) + tuple(self.upstream_m3u_urls):
+            if u not in out:
+                out.append(u)
+        return out
 
     @classmethod
     def from_env(cls, env=None):
@@ -92,6 +109,8 @@ class Config:
             allow_all_clients=env.get("HLS_ALLOW_ALL_CLIENTS", "") == "1",
             default_bandwidth=int(env.get("HLS_DEFAULT_BANDWIDTH", "0")) or 0,
             upstream_m3u_url=env.get("HLS_UPSTREAM_M3U_URL", ""),
+            upstream_m3u_urls=_split_list(env.get("HLS_UPSTREAM_M3U_URLS", "")),
+            upstream_m3u_max_bytes=int(env.get("HLS_UPSTREAM_M3U_MAX_BYTES", str(10 * 1024 * 1024))),
             upstream_m3u_referer=env.get("HLS_UPSTREAM_M3U_REFERER", ""),
             upstream_m3u_ttl=int(env.get("HLS_UPSTREAM_M3U_TTL", str(cache_ttl))),
         )
@@ -165,8 +184,8 @@ class ProxyApp:
         # Guards every shared dict below. Never held across a network fetch.
         self.lock = threading.RLock()
         self.allowed_hosts = set(h.lower() for h in config.extra_allowed_hosts)
-        if config.upstream_m3u_url:
-            self.allow_url_host(config.upstream_m3u_url)
+        for u in config.m3u_sources():
+            self.allow_url_host(u)
         # Cache: slug -> {m3u8_url, embed_host, fetched_at}
         self.channel_cache = {}
         # Maps upstream origin -> referer (learned from /channel/ scrapes + literal mode preload)
@@ -177,9 +196,14 @@ class ProxyApp:
         self.channel_mode = {}
         # Per-channel declared referer from channels.conf field 8 (used by literal mode)
         self.channel_referer = {}
-        # Parsed upstream M3U: list of (slug, extinf_line, url)
+        # Per-channel declared User-Agent (upstream M3U #EXTVLCOPT or similar)
+        self.channel_ua = {}
+        # Merged upstream M3U entries: list of (slug, extinf_line, url)
         self.upstream_m3u = []
-        self.upstream_m3u_fetched_at = 0.0
+        # slug -> (referer, user_agent) from #EXTVLCOPT lines, "" when absent
+        self.m3u_opts = {}
+        # Per-source state: url -> {"entries": [(extinf, url, referer, ua)], "fetched_at": float}
+        self.m3u_sources = {}
         # Per-channel #EXTINF line built from channels.conf (slug -> extinf)
         self.channel_extinf = {}
         self._resolve = socket.getaddrinfo  # overridable seam for offline tests
@@ -247,84 +271,105 @@ class ProxyApp:
 
     # ---- channel loading -----------------------------------------------
 
-    def refresh_upstream_m3u(self) -> None:
-        """Fetch and parse the upstream M3U, registering entries as literal channels.
+    def _fetch_m3u_source(self, url):
+        """Fetch and parse one upstream M3U into [(extinf, url, referer, ua)].
 
-        Cached for upstream_m3u_ttl seconds. On fetch failure the previous entries
-        are retained so transient upstream errors don't wipe the channel list.
+        Touches no shared state, so it runs outside the lock.
         """
         cfg = self.config
-        if not cfg.upstream_m3u_url:
-            return
-        now = time.time()
-        with self.lock:
-            if self.upstream_m3u and (now - self.upstream_m3u_fetched_at) < cfg.upstream_m3u_ttl:
-                return
+        limit = cfg.upstream_m3u_max_bytes
+        with self.fetch(url, {"User-Agent": cfg.upstream_ua}) as resp:
+            raw = resp.read(limit + 1)
+        if len(raw) > limit:
+            raise ValueError(f"upstream M3U larger than {limit} bytes")
+        text = raw.decode("utf-8", errors="replace")
 
-        try:
-            with self.fetch(cfg.upstream_m3u_url, {"User-Agent": cfg.upstream_ua}) as resp:
-                text = resp.read().decode("utf-8", errors="replace")
-        except Exception as e:
-            print(f"[hls-proxy] Failed to fetch upstream M3U: {e}")
-            return
-
-        with self.lock:
-            self._apply_upstream_m3u(text, now)
-
-    def _apply_upstream_m3u(self, text, now):
-        """Parse fetched M3U text into shared state. Caller holds self.lock."""
-        cfg = self.config
         entries = []
-        seen = set()
-        current_extinf = None
-        idx = 0
-        for raw in text.splitlines():
-            line = raw.strip()
+        extinf = None
+        referer = ua = ""
+        for line in text.splitlines():
+            line = line.strip()
             if not line:
                 continue
             if line.startswith("#EXTINF"):
-                current_extinf = line
+                extinf, referer, ua = line, "", ""
+            elif line.upper().startswith("#EXTVLCOPT:"):
+                key, _, val = line[len("#EXTVLCOPT:"):].partition("=")
+                key = key.strip().lower()
+                if key in ("http-referrer", "http-referer"):
+                    referer = val.strip()
+                elif key == "http-user-agent":
+                    ua = val.strip()
+            elif line.startswith("#"):
                 continue
-            if line.startswith("#"):
+            elif extinf is not None:
+                entries.append((extinf, line, referer, ua))
+                extinf = None
+                referer = ua = ""
+        return entries
+
+    def refresh_upstream_m3u(self) -> None:
+        """Fetch every upstream M3U and merge them into literal channels.
+
+        Each source is cached for upstream_m3u_ttl seconds on its own. A source
+        that fails (or comes back empty or oversized) keeps its last good copy,
+        so a transient error never wipes channels. Sources are merged in order
+        (HLS_UPSTREAM_M3U_URL first) and a stream URL appearing in several is
+        kept once, from the first source. Fetches happen outside the lock.
+        """
+        cfg = self.config
+        now = time.time()
+        fetched = {}
+        for url in cfg.m3u_sources():
+            with self.lock:
+                state = self.m3u_sources.get(url)
+                fresh = bool(state and state["entries"]
+                             and (now - state["fetched_at"]) < cfg.upstream_m3u_ttl)
+            if fresh:
                 continue
-            if current_extinf is None:
+            try:
+                entries = self._fetch_m3u_source(url)
+            except Exception as e:
+                print(f"[hls-proxy] Failed to fetch upstream M3U: {e}")
                 continue
+            if entries:
+                fetched[url] = entries
+        if not fetched:
+            return
 
-            idx += 1
-            tvg_id = re.search(r'tvg-id="([^"]*)"', current_extinf)
-            name_match = re.search(r",\s*(.+)$", current_extinf)
-            base = ""
-            if tvg_id and tvg_id.group(1).strip():
-                base = tvg_id.group(1).strip()
-            elif name_match and name_match.group(1).strip():
-                base = name_match.group(1).strip()
-            else:
-                base = f"ch{idx}"
-            slug = _slugify(base)
-            orig_slug = slug
-            n = 1
-            while slug in seen:
-                n += 1
-                slug = f"{orig_slug}-{n}"
-            seen.add(slug)
-            entries.append((slug, current_extinf, line))
-
-            self.channel_mode[slug] = "literal"
-            if cfg.upstream_m3u_referer:
-                self.channel_referer[slug] = cfg.upstream_m3u_referer
-            # Invalidate stale cache so a refreshed upstream URL replaces the old one
-            self.channel_cache.pop(slug, None)
-            origin = _origin_of(line)
-            if origin:
-                self.referer_map.setdefault(origin, cfg.upstream_m3u_referer)
-                self.allow_url_host(line)
-
-            current_extinf = None
-
-        if entries:
-            self.upstream_m3u = entries
-            self.upstream_m3u_fetched_at = now
-            print(f"[hls-proxy] Loaded {len(entries)} channels from upstream M3U")
+        with self.lock:
+            for url, entries in fetched.items():
+                self.m3u_sources[url] = {"entries": entries, "fetched_at": now}
+            merged = []
+            seen_urls = set()
+            seen_slugs = set()
+            idx = 0
+            for url in cfg.m3u_sources():
+                for extinf, stream, referer, ua in self.m3u_sources.get(url, {"entries": []})["entries"]:
+                    if stream in seen_urls:
+                        continue
+                    seen_urls.add(stream)
+                    idx += 1
+                    tvg_id = re.search(r'tvg-id="([^"]*)"', extinf)
+                    name_match = re.search(r",\s*(.+)$", extinf)
+                    if tvg_id and tvg_id.group(1).strip():
+                        base = tvg_id.group(1).strip()
+                    elif name_match and name_match.group(1).strip():
+                        base = name_match.group(1).strip()
+                    else:
+                        base = f"ch{idx}"
+                    slug = orig_slug = _slugify(base)
+                    n = 1
+                    while slug in seen_slugs:
+                        n += 1
+                        slug = f"{orig_slug}-{n}"
+                    seen_slugs.add(slug)
+                    merged.append((slug, extinf, stream))
+                    self.m3u_opts[slug] = (referer, ua)
+                    # Invalidate stale cache so a refreshed upstream URL replaces the old one
+                    self.channel_cache.pop(slug, None)
+            self.upstream_m3u = merged
+        print(f"[hls-proxy] Loaded {len(merged)} channels from {len(cfg.m3u_sources())} upstream M3U source(s)")
 
     def load_channels(self):
         """Load channel config: slug -> source_page_url."""
@@ -332,9 +377,28 @@ class ProxyApp:
             channels = self._read_conf()
         # The upstream M3U fetch happens outside the lock.
         self.refresh_upstream_m3u()
+        cfg = self.config
         with self.lock:
+            # File entries win on slug collisions so a channel can be overridden by hand.
             for slug, _extinf, url in self.upstream_m3u:
-                channels.setdefault(slug, url)
+                if slug in channels:
+                    continue
+                channels[slug] = url
+                referer, ua = self.m3u_opts.get(slug, ("", ""))
+                referer = referer or cfg.upstream_m3u_referer
+                self.channel_mode[slug] = "literal"
+                if referer:
+                    self.channel_referer[slug] = referer
+                else:
+                    self.channel_referer.pop(slug, None)
+                if ua:
+                    self.channel_ua[slug] = ua
+                else:
+                    self.channel_ua.pop(slug, None)
+                origin = _origin_of(url)
+                if origin:
+                    self.referer_map.setdefault(origin, cfg.upstream_m3u_referer)
+                    self.allow_url_host(url)
         return channels
 
     def _read_conf(self):
@@ -362,7 +426,8 @@ class ProxyApp:
                         source_url = parts[5]
                         channels[slug] = source_url
                         self.allow_url_host(source_url)
-                        extinf_attrs = [f'tvg-id="{slug}"']
+                        tvg_id = parts[9].strip() if len(parts) >= 10 and parts[9].strip() else slug
+                        extinf_attrs = [f'tvg-id="{tvg_id}"']
                         if chno:
                             extinf_attrs.append(f'tvg-chno="{chno}"')
                         if logo:
@@ -426,6 +491,20 @@ class ProxyApp:
             self.allow_url_host(m3u8)
 
         return m3u8, embed_host
+
+    def channel_headers(self, slug, embed_host=""):
+        """Upstream request headers for a channel: per-channel, then global."""
+        cfg = self.config
+        with self.lock:
+            ua = self.channel_ua.get(slug)
+            referer = self.channel_referer.get(slug)
+            literal = self.channel_mode.get(slug) == "literal"
+        headers = {"User-Agent": ua or cfg.upstream_ua}
+        if not referer or not literal:
+            referer = (embed_host + "/") if embed_host else (referer or cfg.upstream_referer)
+        if referer:
+            headers["Referer"] = referer
+        return headers
 
     def get_channel_m3u8(self, slug):
         """Get a fresh m3u8 URL for a channel, using cache if still valid."""
@@ -552,6 +631,13 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
             headers = {"User-Agent": cfg.upstream_ua}
             if referer:
                 headers["Referer"] = referer
+            # ?ch=<slug> marks URLs rewritten for a channel with its own headers
+            ch = params.get("ch", [None])[0]
+            with self.app.lock:
+                if ch in self.app.channel_referer:
+                    headers["Referer"] = self.app.channel_referer[ch]
+                if ch in self.app.channel_ua:
+                    headers["User-Agent"] = self.app.channel_ua[ch]
 
             resp = self.app.fetch(upstream_url, headers)
             content_type = resp.headers.get("Content-Type", "application/octet-stream")
@@ -562,7 +648,7 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
                 content = resp.read()
                 resp.close()
                 if b"#EXTM3U" in content:
-                    content = self._rewrite_playlist(content, upstream_url)
+                    content = self._rewrite_playlist(content, upstream_url, ch)
                     content_type = "application/vnd.apple.mpegurl"
                 self._write_body(200, content_type, content, [
                     ("Access-Control-Allow-Origin", "*"),
@@ -610,7 +696,7 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
         """Plain-text landing page describing available endpoints."""
         cfg = self.app.config
         host = self.headers.get("Host", f"{cfg.bind_addr}:{cfg.port}").split("/", 1)[0]
-        upstream = "configured" if cfg.upstream_m3u_url else "not set (HLS_UPSTREAM_M3U_URL)"
+        upstream = "configured" if cfg.m3u_sources() else "not set (HLS_UPSTREAM_M3U_URLS)"
         channels_loaded = len(self.app.upstream_m3u)
         body = (
             f"hls-restream-proxy\n"
@@ -660,7 +746,7 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
         if not emitted:
             self.send_error(
                 404,
-                "No channels configured (set HLS_UPSTREAM_M3U_URL or populate channels.conf)",
+                "No channels configured (set HLS_UPSTREAM_M3U_URLS or populate channels.conf)",
             )
             return
 
@@ -700,12 +786,7 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         try:
-            cfg = self.app.config
-            referer = (embed_host + "/") if embed_host else cfg.upstream_referer
-            resp = self.app.fetch(m3u8_url, {
-                "User-Agent": cfg.upstream_ua,
-                "Referer": referer,
-            })
+            resp = self.app.fetch(m3u8_url, self.app.channel_headers(slug, embed_host))
             upstream_ct = resp.headers.get("Content-Type", "") or ""
             path = m3u8_url.split("?", 1)[0].rstrip("/")
             is_hls = "mpegurl" in upstream_ct.lower() or path.endswith(".m3u8")
@@ -742,7 +823,7 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
                 ])
                 return
 
-            content = self._rewrite_playlist(content, m3u8_url)
+            content = self._rewrite_playlist(content, m3u8_url, slug)
             if bandwidth and is_master:
                 content = self._override_master_bandwidth(content, bandwidth)
             self._write_body(200, "application/vnd.apple.mpegurl", content, [
@@ -781,7 +862,7 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
             out.append(line)
         return "\n".join(out).encode("utf-8")
 
-    def _rewrite_playlist(self, content: bytes, playlist_url: str) -> bytes:
+    def _rewrite_playlist(self, content: bytes, playlist_url: str, ch=None) -> bytes:
         """Rewrite URLs in m3u8 playlists to route through this proxy."""
         text = content.decode("utf-8", errors="replace")
         base_url = playlist_url.rsplit("/", 1)[0] + "/"
@@ -794,16 +875,16 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
                 if "URI=" in line:
                     line = re.sub(
                         r'URI="([^"]+)"',
-                        lambda m: f'URI="{self._proxy_url(m.group(1), base_url)}"',
+                        lambda m: f'URI="{self._proxy_url(m.group(1), base_url, ch)}"',
                         line,
                     )
                 result.append(line)
             else:
-                result.append(self._proxy_url(line, base_url))
+                result.append(self._proxy_url(line, base_url, ch))
 
         return "\n".join(result).encode("utf-8")
 
-    def _proxy_url(self, url: str, base_url: str) -> str:
+    def _proxy_url(self, url: str, base_url: str, ch=None) -> str:
         if url.startswith("http://") or url.startswith("https://"):
             full = url
         else:
@@ -817,7 +898,12 @@ class HLSProxyHandler(http.server.BaseHTTPRequestHandler):
         upstream_path = urllib.parse.urlparse(full).path
         ext_match = re.search(r"\.([A-Za-z0-9]{1,5})$", upstream_path)
         ext = f".{ext_match.group(1).lower()}" if ext_match else ".ts"
-        return f"/proxy{ext}?url={urllib.parse.quote(full, safe='')}"
+        out = f"/proxy{ext}?url={urllib.parse.quote(full, safe='')}"
+        with self.app.lock:
+            has_opts = ch in self.app.channel_referer or ch in self.app.channel_ua
+        if ch and has_opts:
+            out += "&ch=" + urllib.parse.quote(ch, safe="")
+        return out
 
     def log_message(self, format, *args):
         if args and "200" not in str(args[0]) and "206" not in str(args[0]):
@@ -860,8 +946,8 @@ def main():
         print(f"[hls-proxy] Allowed IPs: {', '.join(str(n) for n in config.allowed_ips)}")
     elif config.allow_all_clients:
         print("[hls-proxy] WARNING: HLS_ALLOW_ALL_CLIENTS=1 and no HLS_ALLOWED_IPS. All clients accepted.")
-    if config.upstream_m3u_url:
-        print(f"[hls-proxy] Upstream M3U: {config.upstream_m3u_url} (refresh every {config.upstream_m3u_ttl}s)")
+    if config.m3u_sources():
+        print(f"[hls-proxy] Upstream M3U sources: {len(config.m3u_sources())} (refresh every {config.upstream_m3u_ttl}s)")
     print("[hls-proxy] Endpoints:")
     print("  /proxy?url=<encoded_url>       — proxy with headers")
     print("  /channel/<slug>                — auto-resolve fresh m3u8 (master if bandwidth set)")
