@@ -143,6 +143,20 @@ class ClientAllowlistTest(unittest.TestCase):
         self.addCleanup(p.stop)
         self.assertEqual(p.get("/health")[0], 200)
 
+    def test_health_exempt_but_other_paths_still_refused(self):
+        p = RunningProxy(allowed_ips=hls_proxy._parse_client_networks("10.0.0.0/8")).start()
+        self.addCleanup(p.stop)
+        self.assertEqual(p.get("/health")[0], 200)
+        self.assertEqual(p.get("/")[0], 403)
+
+    def test_dockerfile_healthcheck_uses_ipv4_loopback(self):
+        # Alpine resolves "localhost" to ::1, but the proxy binds IPv4 only.
+        path = os.path.join(os.path.dirname(__file__), "..", "Dockerfile")
+        with open(path) as f:
+            text = f.read()
+        self.assertIn("http://127.0.0.1:8089/health", text)
+        self.assertNotIn("localhost", text)
+
     def test_invalid_entry_is_a_config_error(self):
         with self.assertRaises(hls_proxy.ConfigError):
             hls_proxy._parse_client_networks("10.0.0.0/8,banana")
