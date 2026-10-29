@@ -1,7 +1,7 @@
 # channels.conf — one channel per line
 #
 # Format (pipe-delimited):
-#   slug|Display Name|chno|logo_url|Group Name|source_page_url|mode|referer|bandwidth|tvg_id
+#   slug|Display Name|chno|logo_url|Group Name|source_page_url|mode|referer|bandwidth|tvg_id|user_agent
 #
 # Allowed sources only (see "Source hard line" in the README):
 #   - iptv-org/iptv category lists and guide data
@@ -34,6 +34,11 @@
 #                  blank if the upstream is already a master playlist.
 #   tvg_id       — (optional) tvg-id written to /playlist.m3u for guide
 #                  matching. Defaults to the slug when empty.
+#   user_agent   — (optional) User-Agent sent for this channel instead of the
+#                  global default.
+#
+# channels.conf is re-read when the file changes (including an atomic
+# rename), so an edited URL takes effect without waiting for HLS_CACHE_TTL.
 #
 # Lines starting with # are comments. Blank lines are ignored.
 #

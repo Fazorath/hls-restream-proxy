@@ -270,6 +270,10 @@ class ProxyApp:
         self.m3u_stats = []
         # Per-channel #EXTINF line built from channels.conf (slug -> extinf)
         self.channel_extinf = {}
+        # slug -> source_url as last read from channels.conf, to spot changed URLs
+        self.conf_urls = {}
+        # (inode, mtime_ns, size) of channels.conf at the last read
+        self.conf_stamp = None
         self._resolve = socket.getaddrinfo  # overridable seam for offline tests
         self._opener = urllib.request.OpenerDirector()
         # Only http(s): no file:, ftp: or data: handlers are installed.
@@ -476,16 +480,31 @@ class ProxyApp:
                     self.allow_url_host(url)
         return channels
 
-    def _read_conf(self):
-        """Parse channels.conf into shared state. Caller holds self.lock."""
-        channels = {}
+    def _conf_path(self):
         conf = self.config.channels_conf
         if not conf:
             for p in [os.path.join(os.path.dirname(os.path.abspath(__file__)), "channels.conf"), "/etc/hls-proxy/channels.conf"]:
                 if os.path.exists(p):
                     conf = p
                     break
-        if conf and os.path.exists(conf):
+        return conf if conf and os.path.exists(conf) else None
+
+    def _conf_changed(self):
+        """True when channels.conf is not the file last read (atomic rename included)."""
+        conf = self._conf_path()
+        if not conf:
+            return False
+        st = os.stat(conf)
+        with self.lock:
+            return self.conf_stamp != (st.st_ino, st.st_mtime_ns, st.st_size)
+
+    def _read_conf(self):
+        """Parse channels.conf into shared state. Caller holds self.lock."""
+        channels = {}
+        conf = self._conf_path()
+        if conf:
+            st = os.stat(conf)
+            self.conf_stamp = (st.st_ino, st.st_mtime_ns, st.st_size)
             with open(conf) as f:
                 for line in f:
                     line = line.strip()
@@ -500,6 +519,10 @@ class ProxyApp:
                         group = parts[4].strip() if len(parts) >= 5 else ""
                         source_url = parts[5]
                         channels[slug] = source_url
+                        # A changed URL must not keep serving the cached one.
+                        if self.conf_urls.get(slug, source_url) != source_url:
+                            self.channel_cache.pop(slug, None)
+                        self.conf_urls[slug] = source_url
                         self.allow_url_host(source_url)
                         tvg_id = parts[9].strip() if len(parts) >= 10 and parts[9].strip() else slug
                         extinf_attrs = [f'tvg-id="{tvg_id}"']
@@ -515,6 +538,14 @@ class ProxyApp:
                         self.channel_mode[slug] = mode
                         if referer:
                             self.channel_referer[slug] = referer
+                        else:
+                            self.channel_referer.pop(slug, None)
+                        # Optional 11th field: User-Agent for this channel
+                        ua = parts[10].strip() if len(parts) >= 11 else ""
+                        if ua:
+                            self.channel_ua[slug] = ua
+                        else:
+                            self.channel_ua.pop(slug, None)
                         # Literal mode: source_url IS the m3u8. Pre-seed referer_map so
                         # /proxy?url=... requests for this upstream host use the right
                         # Referer without needing a successful /channel/ scrape first.
@@ -584,6 +615,10 @@ class ProxyApp:
     def get_channel_m3u8(self, slug):
         """Get a fresh m3u8 URL for a channel, using cache if still valid."""
         now = time.time()
+        # Pick up a rewritten channels.conf before trusting the cache.
+        if self._conf_changed():
+            with self.lock:
+                self._read_conf()
         with self.lock:
             cached = self.channel_cache.get(slug)
         if cached and (now - cached["fetched_at"]) < self.config.cache_ttl:
