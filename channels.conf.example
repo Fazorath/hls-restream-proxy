@@ -3,6 +3,13 @@
 # Format (pipe-delimited):
 #   slug|Display Name|chno|logo_url|Group Name|source_page_url|mode|referer|bandwidth|tvg_id
 #
+# Allowed sources only (see "Source hard line" in the README):
+#   - iptv-org/iptv category lists and guide data
+#   - free ad-supported TV services (FAST lists)
+#   - a broadcaster's own official free live stream or live page
+# Never add pirate embed/restream sites, paid channels taken from third-party
+# sites, DRM bypasses, or ways around token systems that protect paying customers.
+#
 # Fields:
 #   slug         — unique channel ID (used in tvg-id)
 #   name         — display name shown in the media player
@@ -15,13 +22,11 @@
 #                    iframe  = page has <iframe> → embed page has m3u8
 #                    direct  = page itself contains the m3u8 URL
 #                    literal = source_url IS the m3u8 URL (no scraping). Use
-#                              this for token-bearing streams where you resolve
-#                              the m3u8 out-of-band (e.g. a site's API or a
-#                              browser JS decryptor). The referer field MUST be
-#                              set so upstream segment fetches succeed.
-#   referer      — (optional) override Referer sent when fetching the embed.
-#                  In literal mode this is required and is sent as the Referer
-#                  on every upstream fetch for that m3u8's host.
+#                              this when the stream URL is published directly,
+#                              e.g. in an iptv-org playlist or a FAST list.
+#   referer      — (optional) override Referer sent when fetching the page.
+#                  Some official streams only answer requests that carry
+#                  their own site as the Referer.
 #   bandwidth    — (optional) real stream bitrate in bits/sec (e.g. 6000000
 #                  for 6 Mbps). When set, the proxy wraps the stream in a
 #                  master playlist with this BANDWIDTH so Jellyfin reads the
@@ -32,9 +37,13 @@
 #
 # Lines starting with # are comments. Blank lines are ignored.
 #
-# Example channels (replace with your own):
+# Example channels (replace the placeholders with your own allowed sources):
 #
-# sporttv1|Sport TV 1|1|https://example.com/logo1.png|Sports|https://example.com/channels/sporttv1.php|iframe||6000000
-# news24|News 24|2|https://example.com/logo2.png|News|https://example.com/live/news.php|iframe||4000000
-# radio1|Radio Stream|3|https://example.com/radio.png|Radio|https://example.com/radio/stream.html|direct||
-# afl|Aussie Rules|4|https://example.com/logo4.png|Sports|https://cdn.example.com/secure/TOKEN/playlist.m3u8|literal|https://embed.example.com/|
+# A broadcaster's own live page, which embeds the official player:
+# local-news|Local News|1|https://example.com/logos/local-news.png|News|https://broadcaster.example/live|iframe||4000000
+#
+# A stream URL taken from an iptv-org category list (for example the "news" category):
+# iptv-org-news|Category List News|2|https://example.com/logos/news.png|News|https://cdn.example/news/playlist.m3u8|literal||
+#
+# A stream URL from a free ad-supported (FAST) list:
+# fast-movies|FAST Movies|3|https://example.com/logos/movies.png|Movies|https://fast.example/movies/playlist.m3u8|literal||6000000

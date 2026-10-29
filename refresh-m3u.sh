@@ -36,9 +36,8 @@ fi
 #   iframe   — page contains <iframe src="...">, embed page contains m3u8
 #   direct   — page itself contains the m3u8 URL
 #   literal  — source_url IS the m3u8 URL; skip scraping entirely. Use this for
-#              token-bearing streams where the m3u8 is produced off-box (e.g. a
-#              site's API or a browser-side JS decryptor) and you only need the
-#              proxy to inject Referer/User-Agent headers on the segment fetches.
+#              stream URLs published directly (an iptv-org list, a FAST list) when
+#              you only need the proxy to inject Referer/User-Agent headers.
 extract_m3u8() {
   local page_url="$1"
   local mode="${2:-iframe}"
