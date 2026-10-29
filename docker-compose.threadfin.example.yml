@@ -1,0 +1,41 @@
+# Proxy + Threadfin on one private network.
+# The proxy publishes no host port: only Threadfin is reachable from outside,
+# and the proxy accepts clients from the stack subnet alone.
+services:
+  hls-proxy:
+    build: .
+    # No "ports:" on purpose. Threadfin reaches it as http://hls-proxy:8089.
+    volumes:
+      - ./channels.conf:/app/channels.conf:ro
+    environment:
+      - HLS_PROXY_PORT=8089
+      - HLS_PROXY_BIND=0.0.0.0
+      # The stack subnet below: only Threadfin (and other stack members) may call the proxy.
+      - HLS_ALLOWED_IPS=172.28.0.0/24
+      - HLS_CACHE_TTL=3600
+    networks:
+      - livetv
+    restart: unless-stopped
+
+  threadfin:
+    image: fyb3roptik/threadfin:latest
+    ports:
+      - "34400:34400"
+    volumes:
+      - ./threadfin-conf:/home/threadfin/conf
+    environment:
+      - TZ=UTC
+    networks:
+      - livetv
+    depends_on:
+      - hls-proxy
+    restart: unless-stopped
+    # After first start, open http://YOUR_HOST:34400/web/ and set
+    # Settings -> Buffer to "-" (no buffer), so Threadfin passes the proxy
+    # stream through untouched instead of re-buffering it.
+
+networks:
+  livetv:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
